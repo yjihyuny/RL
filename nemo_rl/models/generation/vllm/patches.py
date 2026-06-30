@@ -92,6 +92,14 @@ def _patch_vllm_init_workers_ray(
         "NCCL_CUMEM_ENABLE",
         "NCCL_NVLS_ENABLE",
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
+        # Forward the CUDA/toolchain vars so isolated vLLM workers resolve the
+        # same nvcc/ptxas/libraries as the driver (needed for Kimi K2.6 custom
+        # kernels under HSG container runtimes).
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "TRITON_PTXAS_PATH",
         *(extra_env_vars or []),
     ]
     additional_env_str = ", ".join(f'"{env_var}"' for env_var in additional_env_vars)

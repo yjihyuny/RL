@@ -180,3 +180,67 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
     with pytest.raises(ValueError, match="No MTP layer weights"):
         ext.load_mtp_weights_from_disk(str(model_dir))
     ext._load_draft_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_is_kimi_architecture():
+    """Architecture detection matches any 'Kimi*' entry and tolerates None."""
+    from nemo_rl.models.generation.vllm.vllm_backend import is_kimi_architecture
+
+    assert is_kimi_architecture(["KimiForCausalLM"]) is True
+    assert is_kimi_architecture(["LlamaForCausalLM", "KimiVLForConditionalGeneration"])
+    assert is_kimi_architecture(["LlamaForCausalLM"]) is False
+    assert is_kimi_architecture([]) is False
+    assert is_kimi_architecture(None) is False
+
+
+@pytest.mark.vllm
+def test_is_truthy_env(monkeypatch):
+    """is_truthy_env accepts the documented truthy spellings and defaults to False."""
+    from nemo_rl.models.generation.vllm.vllm_backend import is_truthy_env
+
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("KIMI_TEST_FLAG", value)
+        assert is_truthy_env("KIMI_TEST_FLAG") is True
+    for value in ("0", "false", "no", ""):
+        monkeypatch.setenv("KIMI_TEST_FLAG", value)
+        assert is_truthy_env("KIMI_TEST_FLAG") is False
+    monkeypatch.delenv("KIMI_TEST_FLAG", raising=False)
+    assert is_truthy_env("KIMI_TEST_FLAG") is False
+
+
+@pytest.mark.vllm
+def test_raise_if_kimi_expert_weights_reach_generic_loader(monkeypatch):
+    """The guard only fires for routed-expert tensors when expert refit is enabled."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _raise_if_kimi_expert_weights_reach_generic_loader,
+    )
+
+    expert = [("model.layers.3.mlp.experts.0.down_proj.weight_packed", torch.zeros(1))]
+    nonexpert = [("model.layers.3.self_attn.q_proj.weight", torch.zeros(1))]
+
+    # Disabled: never raises, even for expert tensors.
+    monkeypatch.delenv("KIMI_APPLY_PROVEN_TP8_EXPERT_REFIT", raising=False)
+    _raise_if_kimi_expert_weights_reach_generic_loader(expert)
+
+    # Enabled: expert tensors leaking to the generic loader is a hard error,
+    # non-expert tensors pass through.
+    monkeypatch.setenv("KIMI_APPLY_PROVEN_TP8_EXPERT_REFIT", "true")
+    _raise_if_kimi_expert_weights_reach_generic_loader(nonexpert)
+    with pytest.raises(RuntimeError, match="routed expert tensors"):
+        _raise_if_kimi_expert_weights_reach_generic_loader(expert)
+
+
+@pytest.mark.vllm
+def test_kimi_nonexpert_name_variants():
+    """Name-variant expansion is deduped and covers the language_model/model prefixes."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _kimi_nonexpert_name_variants,
+    )
+
+    variants = _kimi_nonexpert_name_variants("layers.0.self_attn.q_proj.weight")
+    assert "layers.0.self_attn.q_proj.weight" in variants
+    assert "model.layers.0.self_attn.q_proj.weight" in variants
+    assert "language_model.model.layers.0.self_attn.q_proj.weight" in variants
+    # No duplicates.
+    assert len(variants) == len(set(variants))
