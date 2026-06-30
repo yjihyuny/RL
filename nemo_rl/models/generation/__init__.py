@@ -44,8 +44,10 @@ def configure_generation_config(
     # vllm setting
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
-        # set load_format
-        config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # set load_format unless the caller explicitly configured it (e.g. a
+        # Kimi launcher that deliberately switches between "dummy" and "auto")
+        if "load_format" not in config["vllm_cfg"]:
+            config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:
             # Speculative decoding needs real draft weights at startup, since the

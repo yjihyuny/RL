@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import fcntl
 import logging
 import os
 import shlex
@@ -28,6 +29,46 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 
 logger = logging.getLogger(__name__)
+
+
+def _uv_sync_args_from_run_command(exec_cmd: list[str]) -> list[str]:
+    """Return uv sync args that mirror the extras requested by a uv run command."""
+    sync_args: list[str] = []
+    i = 0
+    while i < len(exec_cmd):
+        arg = exec_cmd[i]
+        if arg in ("--extra", "--group", "--package") and i + 1 < len(exec_cmd):
+            sync_args.extend([arg, exec_cmd[i + 1]])
+            i += 2
+            continue
+        if (
+            arg.startswith("--extra=")
+            or arg.startswith("--group=")
+            or arg.startswith("--package=")
+        ):
+            sync_args.append(arg)
+        elif arg in (
+            "--all-extras",
+            "--all-groups",
+            "--no-dev",
+            "--only-dev",
+            "--all-packages",
+        ):
+            sync_args.append(arg)
+        i += 1
+    return sync_args
+
+
+def _with_uv_no_sync(exec_cmd: list[str]) -> list[str]:
+    """Insert ``--no-sync`` into a ``uv run`` command when packages are skipped."""
+    if (
+        len(exec_cmd) >= 2
+        and exec_cmd[0] == "uv"
+        and exec_cmd[1] == "run"
+        and "--no-sync" not in exec_cmd
+    ):
+        return [exec_cmd[0], exec_cmd[1], "--no-sync", *exec_cmd[2:]]
+    return exec_cmd
 
 
 @lru_cache(maxsize=None)
@@ -93,8 +134,29 @@ def create_local_venv(
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
+    no_install_packages = [
+        package.strip()
+        for package in os.environ.get("NRL_UV_NO_INSTALL_PACKAGES", "").split(",")
+        if package.strip()
+    ]
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    sync_cmd = ["uv", "sync", "--directory", git_root, "--locked"]
+    if no_install_packages:
+        sync_cmd.extend(_uv_sync_args_from_run_command(exec_cmd))
+        for package in no_install_packages:
+            sync_cmd.extend(["--no-install-package", package])
+        exec_cmd = _with_uv_no_sync(exec_cmd)
+    # uv editable installs for Megatron-LM build a C++ extension and copy it
+    # back into the shared source tree. On multi-node launches, concurrent
+    # builders can race on that shared file. Serialize sync while allowing the
+    # node-local venv creation above to remain parallel.
+    lock_path = os.path.join(git_root, ".nemo_rl_uv_sync.lock")
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            subprocess.run(sync_cmd, env=env, check=True)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment

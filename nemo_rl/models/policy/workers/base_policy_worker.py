@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Any, Optional
 
 import ray
@@ -78,14 +79,13 @@ class AbstractPolicyWorker:
     def maybe_init_zmq(self) -> None:
         """Initialize the ZMQ socket if it doesn't exist."""
         if not hasattr(self, "zmq_socket"):
+            # Default 120s; large-model refit (e.g. Kimi K2.6) can exceed it, so
+            # allow override via NRL_ZMQ_TIMEOUT_MS.
+            zmq_timeout_ms = int(os.getenv("NRL_ZMQ_TIMEOUT_MS", "120000"))
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, zmq_timeout_ms)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, zmq_timeout_ms)
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
