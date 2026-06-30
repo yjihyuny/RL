@@ -907,6 +907,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         Returns:
             dict: A dictionary containing the info for refit.
         """
+        # When metadata travels in each IPC payload, the receiver no longer needs
+        # the setup-time HF metadata export, so skip the worker fanout entirely to
+        # avoid a duplicate export pass and a repeated-refit ordering risk.
+        truthy = {"1", "true", "yes", "y", "on"}
+        metadata_in_payload = (
+            str(os.environ.get("NRL_IPC_REFIT_METADATA_IN_PAYLOAD", "")).lower()
+            in truthy
+        )
+        if not metadata_in_payload:
+            env_vars = self.cfg.get("megatron_cfg", {}).get("env_vars", {}) or {}
+            metadata_in_payload = (
+                str(env_vars.get("NRL_IPC_REFIT_METADATA_IN_PAYLOAD", "")).lower()
+                in truthy
+            )
+        if metadata_in_payload:
+            return {}
+
         futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result

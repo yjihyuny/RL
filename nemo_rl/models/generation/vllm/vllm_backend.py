@@ -22,6 +22,7 @@ import zmq
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
+    decode_refit_param_entry,
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -370,10 +371,13 @@ class VllmInternalWorkerExtension:
                 weight = None
                 weights = []
                 offset = 0
-                for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]  # pyrefly
-                    if isinstance(shape, list):
-                        shape = torch.Size(shape)
+                for entry in list_keys:
+                    # Entry is either a bare name (metadata looked up locally) or a
+                    # (name, shape, dtype) tuple when the sender enabled
+                    # NRL_IPC_REFIT_METADATA_IN_PAYLOAD.
+                    key, shape, dtype = decode_refit_param_entry(
+                        entry, self.state_dict_info
+                    )
 
                     # Get the weight from the buffer
                     size_in_bytes = dtype.itemsize * shape.numel()

@@ -359,7 +359,12 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    metadata_in_payload: Optional[bool] = None,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -372,11 +377,22 @@ def stream_weights_via_ipc_zmq_impl(
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        metadata_in_payload: When True, each group's payload carries per-param
+            ``(name, shape, dtype)`` tuples instead of bare names, so the receiver
+            does not need a pre-exported ``state_dict_info``. Defaults to the
+            ``NRL_IPC_REFIT_METADATA_IN_PAYLOAD`` env flag when None.
     """
+    if metadata_in_payload is None:
+        metadata_in_payload = str(
+            os.environ.get("NRL_IPC_REFIT_METADATA_IN_PAYLOAD", "")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
 
-    def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
+    def send_buffer_group_overlap(
+        buffer, param_entries, used_bytes, await_recv
+    ) -> bool:
         """Send a group of parameters and return new pending_recv state."""
         # Synchronize before getting IPC handle to ensure data is ready
         torch.cuda.current_stream().synchronize()
@@ -385,8 +401,10 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Payload tuple: (cuda_ipc_handle, param_names, used_bytes)
-        payload = (cuda_ipc_handle, param_names, used_bytes)
+        # Payload tuple: (cuda_ipc_handle, param_entries, used_bytes). Each entry is
+        # either a bare name (str) or a (name, shape, dtype) tuple when
+        # metadata_in_payload is set; the receiver branches on the entry type.
+        payload = (cuda_ipc_handle, param_entries, used_bytes)
         zmq_socket.send_pyobj(payload)
         return True  # pending_recv = True
 
@@ -416,7 +434,7 @@ def stream_weights_via_ipc_zmq_impl(
     current_buffer: torch.Tensor | None = None
 
     used_bytes = 0
-    param_names = []
+    param_entries = []
     await_recv = False
     count_of_groups = 0
 
@@ -439,22 +457,25 @@ def stream_weights_via_ipc_zmq_impl(
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
                 await_recv = send_buffer_group_overlap(
-                    current_buffer, param_names, used_bytes, await_recv
+                    current_buffer, param_entries, used_bytes, await_recv
                 )
                 count_of_groups += 1
 
                 # Switch buffers for ping-pong double buffering
                 current_buffer = buffer_b if current_buffer is buffer_a else buffer_a
-                used_bytes, param_names = 0, []
+                used_bytes, param_entries = 0, []
 
             # Pack tensor into current buffer
-            param_names.append(name)
+            if metadata_in_payload:
+                param_entries.append((name, tuple(tensor.shape), tensor.dtype))
+            else:
+                param_entries.append(name)
             used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
 
         # Send remaining tensors
-        if param_names:
+        if param_entries:
             await_recv = send_buffer_group_overlap(
-                current_buffer, param_names, used_bytes, await_recv
+                current_buffer, param_entries, used_bytes, await_recv
             )
             count_of_groups += 1
 
@@ -469,7 +490,9 @@ def stream_weights_via_ipc_zmq_impl(
 
         if rank == 0:
             print(
-                f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True
+                f"{worker_name}: Packed {count_of_groups} groups of tensors "
+                f"(metadata_in_payload={metadata_in_payload})",
+                flush=True,
             )
 
     except zmq.Again:
@@ -497,6 +520,30 @@ def stream_weights_via_ipc_zmq_impl(
         # Force garbage collection and clear CUDA cache
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def decode_refit_param_entry(
+    entry: Any, state_dict_info: dict[str, tuple[Any, Any]]
+) -> tuple[str, torch.Size, torch.dtype]:
+    """Decode one IPC refit list entry into ``(name, shape, dtype)``.
+
+    Counterpart to the ``param_entries`` packed by
+    :func:`stream_weights_via_ipc_zmq_impl`. Supports both encodings:
+
+    - metadata-in-payload: a ``(name, shape, dtype)`` tuple, decoded directly;
+    - legacy bare name: a ``str`` whose shape/dtype are looked up in
+      ``state_dict_info``.
+
+    ``shape`` is normalized to a :class:`torch.Size`.
+    """
+    if isinstance(entry, tuple) and len(entry) == 3 and isinstance(entry[0], str):
+        key, shape, dtype = entry
+    else:
+        key = entry
+        shape, dtype = state_dict_info[key]
+    if isinstance(shape, (list, tuple)):
+        shape = torch.Size(shape)
+    return key, shape, dtype
 
 
 def rebuild_cuda_tensor_from_ipc(

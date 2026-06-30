@@ -27,6 +27,7 @@ from nemo_rl.models.policy.utils import (
     IPCProtocol,
     aggregate_per_sample_handles,
     calculate_aligned_size,
+    decode_refit_param_entry,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
@@ -208,6 +209,78 @@ def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
         calculate_aligned_size(tensor.nbytes) for _, tensor in tensors
     )
     assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_metadata_in_payload(monkeypatch):
+    """metadata_in_payload packs (name, shape, dtype) entries instead of bare names."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensors = [
+        ("weight", torch.ones(4, dtype=torch.float32)),
+        ("bias", torch.ones(3, dtype=torch.float16)),
+    ]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda tensor: ("ipc-handle",),
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter(tensors),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+        metadata_in_payload=True,
+    )
+
+    payload = socket.sent[0]
+    assert payload[1] == [
+        ("weight", (4,), torch.float32),
+        ("bias", (3,), torch.float16),
+    ]
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+class TestDecodeRefitParamEntry:
+    """Receiver-side decoding of IPC refit param entries."""
+
+    def test_metadata_tuple_decoded_directly(self):
+        key, shape, dtype = decode_refit_param_entry(
+            ("layers.0.weight", (2, 3), torch.bfloat16),
+            state_dict_info={},
+        )
+        assert key == "layers.0.weight"
+        assert shape == torch.Size([2, 3])
+        assert isinstance(shape, torch.Size)
+        assert dtype == torch.bfloat16
+
+    def test_bare_name_falls_back_to_state_dict_info(self):
+        state_dict_info = {"layers.0.weight": (torch.Size([4]), torch.float32)}
+        key, shape, dtype = decode_refit_param_entry(
+            "layers.0.weight", state_dict_info=state_dict_info
+        )
+        assert key == "layers.0.weight"
+        assert shape == torch.Size([4])
+        assert dtype == torch.float32
+
+    def test_list_shape_normalized_to_size(self):
+        _, shape, _ = decode_refit_param_entry(
+            ("w", [2, 2], torch.float16), state_dict_info={}
+        )
+        assert isinstance(shape, torch.Size)
+        assert shape == torch.Size([2, 2])
+
+    def test_send_then_decode_round_trip(self):
+        """An entry packed by the sender decodes back to the original metadata."""
+        name, shape, dtype = "mlp.w1", (8, 16), torch.bfloat16
+        # Mirror the sender's metadata_in_payload encoding.
+        entry = (name, tuple(torch.empty(shape, dtype=dtype).shape), dtype)
+        decoded = decode_refit_param_entry(entry, state_dict_info={})
+        assert decoded == (name, torch.Size(shape), dtype)
 
 
 def server_process(
