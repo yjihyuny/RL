@@ -18,6 +18,7 @@ import os
 import threading
 import time
 import warnings
+from datetime import timedelta
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -157,11 +158,36 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
+    # Large-model refit (e.g. Kimi K2.6) can exceed the default NCCL timeout, both
+    # for the world group and for Megatron-created subgroups. Raise both via
+    # KIMI_NCCL_TIMEOUT_MINUTES (default 30).
+    timeout_minutes = int(os.environ.get("KIMI_NCCL_TIMEOUT_MINUTES", "30"))
+    _patch_new_group_timeout(timeout_minutes)
     # Pin the communicator to the correct GPU explicitly.
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.distributed.init_process_group(
-        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+        "nccl",
+        timeout=timedelta(minutes=timeout_minutes),
+        device_id=torch.device(f"cuda:{local_rank}"),
     )
+
+
+def _patch_new_group_timeout(timeout_minutes: int) -> None:
+    """Apply the configured NCCL timeout to Megatron-created subgroups."""
+    if getattr(torch.distributed, "_kimi_new_group_timeout_patched", False):
+        return
+
+    original_new_group = torch.distributed.new_group
+    timeout = timedelta(minutes=timeout_minutes)
+
+    def new_group_with_timeout(*args, **kwargs):
+        group_timeout = kwargs.get("timeout")
+        if group_timeout is None or group_timeout < timeout:
+            kwargs["timeout"] = timeout
+        return original_new_group(*args, **kwargs)
+
+    torch.distributed.new_group = new_group_with_timeout
+    torch.distributed._kimi_new_group_timeout_patched = True
 
 
 def validate_and_set_config(
@@ -269,6 +295,91 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     """Return a short stable hash for hf_config_overrides."""
     canonical = _canonicalize_hf_config_overrides(overrides)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def _get_hf_architectures_override(
+    hf_config_overrides: dict[str, Any],
+) -> list[str]:
+    """Return a normalized architectures override list, if configured."""
+    architectures = hf_config_overrides.get("architectures")
+    if architectures is None:
+        return []
+    if isinstance(architectures, str):
+        return [architectures]
+    return [str(architecture) for architecture in architectures]
+
+
+def _iter_hf_config_candidates(root: Any):
+    """Yield config-like objects reachable through common HF wrapper attrs."""
+    visited: set[int] = set()
+    stack: list[tuple[str, Any]] = [("root", root)]
+    child_attrs = (
+        "hf_pretrained",
+        "config",
+        "hf_config",
+        "text_config",
+        "language_config",
+    )
+
+    while stack:
+        path, obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        if (
+            hasattr(obj, "architectures")
+            or hasattr(obj, "model_type")
+            or hasattr(obj, "to_dict")
+        ):
+            yield path, obj
+
+        for attr in child_attrs:
+            try:
+                child = getattr(obj, attr, None)
+            except Exception:
+                continue
+            if child is not None and child is not obj:
+                stack.append((f"{path}.{attr}", child))
+
+
+def _apply_hf_config_architectures_override(
+    root: Any,
+    hf_config_overrides: dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    """Propagate the architectures override onto retained HF config objects.
+
+    Needed so Kimi (whose checkpoints omit ``architectures``) resolves to the
+    correct Megatron-Bridge provider. No-op when no override is configured.
+    """
+    architectures = _get_hf_architectures_override(hf_config_overrides)
+    if not architectures:
+        return
+
+    patched_paths: list[str] = []
+    for path, config_obj in _iter_hf_config_candidates(root):
+        if getattr(config_obj, "architectures", None):
+            continue
+        try:
+            setattr(config_obj, "architectures", list(architectures))
+        except Exception:
+            continue
+        patched_paths.append(path)
+
+    if hasattr(root, "__dict__"):
+        root.__dict__.pop("_causal_lm_architecture", None)
+
+    if patched_paths:
+        print(
+            "KIMI applied HF architectures override for "
+            f"{context}: architectures={architectures} patched={patched_paths}",
+            flush=True,
+        )
 
 
 def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
@@ -432,6 +543,11 @@ def setup_model_config(
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
         hf_cfg = AutoConfig.from_pretrained(
             hf_model_name, trust_remote_code=True, **hf_config_overrides
+        )
+        _apply_hf_config_architectures_override(
+            hf_cfg,
+            hf_config_overrides,
+            context="megatron_lm config load",
         )
         bridge_obj = AutoBridge.from_hf_config(hf_cfg)
         model_cfg = bridge_obj.to_megatron_provider(load_weights=False)
@@ -1571,8 +1687,14 @@ def finalize_megatron_setup(
     )
 
     dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
+    hf_config_overrides = config.get("hf_config_overrides", {}) or {}
     megatron_bridge = AutoBridge.from_hf_pretrained(
-        hf_model_name, trust_remote_code=True
+        hf_model_name, trust_remote_code=True, **hf_config_overrides
+    )
+    _apply_hf_config_architectures_override(
+        megatron_bridge,
+        hf_config_overrides,
+        context="refit AutoBridge",
     )
 
     should_disable_forward_pre_hook = (
