@@ -1,0 +1,150 @@
+defaults: ../../sft.yaml
+
+sft:
+  max_num_steps: 1
+  val_period: 1000000
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/sft-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  save_period: 1
+  keep_top_k: 1
+  save_optimizer: true
+  metric_name: null
+  higher_is_better: false
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: moonshotai/Kimi-K2.6
+  tokenizer:
+    name: ${policy.model_name}
+    trust_remote_code: true
+    chat_template: default
+    chat_template_kwargs: null
+
+  hf_config_overrides:
+    architectures:
+      - KimiK25ForConditionalGeneration
+
+  train_global_batch_size: 1
+  train_micro_batch_size: 1
+  max_total_sequence_length: 1024
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  optimizer: null
+
+  dtensor_cfg:
+    enabled: false
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    recompute_granularity: full
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 1
+    sequence_parallel: true
+    defer_fp32_logits: true
+
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+
+    fp8_cfg:
+      enabled: false
+      fp8_param: false
+
+    optimizer:
+      optimizer: adam
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: torch.float32
+      main_params_dtype: torch.float16
+      main_grads_dtype: torch.bfloat16
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.75
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 1
+      lr_warmup_init: 1.0e-11
+
+    checkpoint:
+      async_save: false
+      fully_parallel_save: true
+      fully_parallel_load: true
+      ckpt_format: torch_dist
+      storage_writers_per_rank: 1
+      save_optim: ${checkpointing.save_optimizer}
+      save_rng: false
+      save_tokenizer_assets: false
+
+data:
+  max_input_seq_length: 1024
+  add_generation_prompt: true
+  num_workers: 8
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
+
+logger:
+  monitor_gpus: false
+  wandb_enabled: false
+  tensorboard_enabled: true
+  log_dir: logs/sft-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  wandb:
+    project: nemo-rl
+    name: sft-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  mlflow:
+    run_name: sft-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16

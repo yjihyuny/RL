@@ -275,6 +275,7 @@ guides/rm.md
 guides/environments.md
 guides/eval.md
 guides/deepseek.md
+guides/kimi-k2-6.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
